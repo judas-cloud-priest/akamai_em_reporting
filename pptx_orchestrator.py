@@ -238,15 +238,27 @@ class PPTXOrchestrator:
         target_upper = target_tag.upper()
         metric_upper = metric.upper()
         
+        # 1. CP Code 처리 (콤마나 단위 없이 순수 텍스트/숫자로 출력)
+        if "CPCODE" in target_upper or "CPCODE" in metric_upper:
+            try:
+                return str(int(float(value)))
+            except (ValueError, TypeError):
+                return str(value)
+
+        # 2. 퍼센트(%) 처리
         if "PERCENT" in target_upper or "PCT" in target_upper or "ACC_VOL" in target_upper or "PERCENT" in metric_upper or "OFFLOAD" in target_upper:
             return f"{value:,.2f}%"
+            
+        # 3. 강제 카운트(건수) 처리
         if "CNT" in target_upper or "COUNT" in target_upper or "ERR" in target_upper:
             return f"{value:,.0f}"
             
+        # 4. 단위 식별
         is_hits = "HITS" in target_upper or "HPS" in target_upper or "HITS" in metric_upper
         is_bytes = "BYTES" in target_upper or "BYTES" in metric_upper
-        is_bps = not (is_hits or is_bytes) and ("BPS" in target_upper or "BITSPERSECOND" in metric_upper)
+        is_bps = "BPS" in target_upper or "BITSPERSECOND" in metric_upper
         
+        # 5. 각 단위별 접미사(Suffix) 정의
         if is_hits:
             if "PEAK" in target_upper or "HPS" in target_upper:
                 u_p, u_t, u_g, u_m, u_k, u_base = "P Hits/s", "T Hits/s", "G Hits/s", "M Hits/s", "K Hits/s", "Hits/s"
@@ -254,9 +266,16 @@ class PPTXOrchestrator:
                 u_p, u_t, u_g, u_m, u_k, u_base = "P Hits", "T Hits", "G Hits", "M Hits", "K Hits", "Hits"
         elif is_bps:
             u_p, u_t, u_g, u_m, u_k, u_base = "Pbps", "Tbps", "Gbps", "Mbps", "Kbps", "bps"
-        else:
+        elif is_bytes:
             u_p, u_t, u_g, u_m, u_k, u_base = "PB", "TB", "GB", "MB", "KB", "B"
+        else:
+            # Bytes, Hits, bps 어느 것에도 해당하지 않는 일반 숫자 처리
+            if float(value).is_integer():
+                return f"{value:,.0f}"
+            else:
+                return f"{value:,.2f}"
             
+        # 6. 지정된 단위가 있는 경우에만 스케일링 적용 (K, M, G, T, P)
         if value >= 1_000_000_000_000_000: return f"{value / 1_000_000_000_000_000:,.2f} {u_p}"
         elif value >= 1_000_000_000_000: return f"{value / 1_000_000_000_000:,.2f} {u_t}"
         elif value >= 1_000_000_000: return f"{value / 1_000_000_000:,.2f} {u_g}"
@@ -415,6 +434,13 @@ class PPTXOrchestrator:
         for s_name, s_values in raw_series_data.items():
             chart_data.add_series(f"{s_name}{unit_suffix}", tuple([v / scale_factor for v in s_values]))
         shape.chart.replace_data(chart_data)
+
+        # 👇 [여기에 추가] 범례(Legend) 강제 새로고침 트릭
+        if shape.chart.has_legend:
+            shape.chart.has_legend = False
+            shape.chart.has_legend = True
+            
+        logger.info(f"[Slide {slide_idx}] Chart dynamically updated with {len(categories)} categories and {len(series_mappings)} series.")
 
     def _handle_update_pie_chart(self, slide_idx, shape, directive, response_data):
         if not shape.has_chart: return
