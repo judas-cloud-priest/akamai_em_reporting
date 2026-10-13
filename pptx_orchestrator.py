@@ -121,16 +121,33 @@ class PPTXOrchestrator:
     def _align_date_for_interval(self, date_str, interval, is_end=False):
         if not date_str: return date_str
         try:
-            dt_str = str(date_str).replace('Z', '+00:00')
-            dt = datetime.fromisoformat(dt_str)
-            if interval == "DAY":
+            # 파이썬 버전에 따른 타임존 파싱 버그를 원천 차단하기 위해 
+            # 앞의 19자리(YYYY-MM-DDTHH:MM:SS)만 순수하게 잘라내서 계산합니다.
+            clean_str = str(date_str)[:19] 
+            dt = datetime.fromisoformat(clean_str)
+            
+            if interval.upper() == "DAY":
                 if is_end:
                     if dt.hour != 0 or dt.minute != 0 or dt.second != 0:
                         dt = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
                 else:
                     dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                    
+            elif interval.upper() == "MONTH":
+                # 다음 달 1일 00:00:00으로 완벽하게 스냅(Snap) 처리
+                if is_end:
+                    if dt.month == 12:
+                        dt = dt.replace(year=dt.year+1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                    else:
+                        dt = dt.replace(month=dt.month+1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                else:
+                    # 이번 달 1일 00:00:00으로 처리
+                    dt = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                    
+            # 계산 완료 후 Akamai가 요구하는 'Z'를 끝에 다시 붙여 반환
             return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-        except ValueError:
+        except Exception as e:
+            logger.error(f"Date alignment failed for {date_str}: {e}")
             return str(date_str)
 
     def _process_shape_directive(self, slide_idx, shape, directive, ignore_cache):
@@ -151,10 +168,17 @@ class PPTXOrchestrator:
         cpcode_list = [code.strip() for code in active_cpcodes.split(',')]
         endpoint_template = directive.get("endpoint", "")
         
-        api_start, api_end = active_start, active_end
+        # 날짜 포맷 강제 변환 (Z 포맷)
+        api_start = self._format_api_date(active_start) if hasattr(self, '_format_api_date') else active_start
+        api_end = self._format_api_date(active_end) if hasattr(self, '_format_api_date') else active_end
+        
+        # INTERVAL에 따른 날짜 올림 처리 로직 명시
         if "INTERVAL=DAY" in endpoint_template.upper():
-            api_start = self._align_date_for_interval(active_start, "DAY", is_end=False)
-            api_end = self._align_date_for_interval(active_end, "DAY", is_end=True)
+            api_start = self._align_date_for_interval(api_start, "DAY", is_end=False)
+            api_end = self._align_date_for_interval(api_end, "DAY", is_end=True)
+        elif "INTERVAL=MONTH" in endpoint_template.upper():
+            api_start = self._align_date_for_interval(api_start, "MONTH", is_end=False)
+            api_end = self._align_date_for_interval(api_end, "MONTH", is_end=True)
         
         endpoint = endpoint_template.replace("{START_DATE}", api_start).replace("{END_DATE}", api_end)
         
@@ -238,51 +262,56 @@ class PPTXOrchestrator:
         target_upper = target_tag.upper()
         metric_upper = metric.upper()
         
-        # 1. CP Code 처리 (앞자리의 '0'을 완벽히 보존하며 콤마 없이 출력)
+        # 1. CP Code 처리 (앞자리 '0' 보존)
         if "CPCODE" in target_upper or "CPCODE" in metric_upper:
             val_str = str(value)
-            # 데이터 처리 중 float로 변환되어 ".0"이 붙은 경우만 잘라냄
             if val_str.endswith('.0'):
                 return val_str[:-2]
             return val_str
 
-        # 2. 퍼센트(%) 처리
+        # 2. 순수 텍스트(문자열) 감지 및 원본 반환
+        try:
+            float_val = float(value)
+        except (ValueError, TypeError):
+            return str(value)
+
+        # 3. 퍼센트(%) 처리
         if "PERCENT" in target_upper or "PCT" in target_upper or "ACC_VOL" in target_upper or "PERCENT" in metric_upper or "OFFLOAD" in target_upper:
-            return f"{value:,.2f}%"
+            return f"{float_val:,.2f}%"
             
-        # 3. 강제 카운트(건수) 처리
+        # 4. 강제 카운트(건수) 처리
         if "CNT" in target_upper or "COUNT" in target_upper or "ERR" in target_upper:
-            return f"{value:,.0f}"
+            return f"{float_val:,.0f}"
             
-        # 4. 단위 식별
+        # 5. 단위 식별 키워드 설정 (BYTE 포함 추가)
         is_hits = "HITS" in target_upper or "HPS" in target_upper or "HITS" in metric_upper
-        is_bytes = "BYTES" in target_upper or "BYTES" in metric_upper
+        is_bytes = "BYTE" in target_upper or "BYTE" in metric_upper
         is_bps = "BPS" in target_upper or "BITSPERSECOND" in metric_upper
         
-        # 5. 각 단위별 접미사(Suffix) 정의
+        # 6. 각 단위별 접미사(Suffix) 정의 - 💡 [핵심 수정] BYTES 조건을 BPS보다 먼저 확인합니다!
         if is_hits:
             if "PEAK" in target_upper or "HPS" in target_upper:
                 u_p, u_t, u_g, u_m, u_k, u_base = "P Hits/s", "T Hits/s", "G Hits/s", "M Hits/s", "K Hits/s", "Hits/s"
             else:
                 u_p, u_t, u_g, u_m, u_k, u_base = "P Hits", "T Hits", "G Hits", "M Hits", "K Hits", "Hits"
+        elif is_bytes:  # <--- BYTES가 우선합니다! (EDGE_BYTES 등은 무조건 이쪽으로 빠짐)
+            u_p, u_t, u_g, u_m, u_k, u_base = "PB", "TB", "GB", "MB", "KB", "B"
         elif is_bps:
             u_p, u_t, u_g, u_m, u_k, u_base = "Pbps", "Tbps", "Gbps", "Mbps", "Kbps", "bps"
-        elif is_bytes:
-            u_p, u_t, u_g, u_m, u_k, u_base = "PB", "TB", "GB", "MB", "KB", "B"
         else:
-            # Bytes, Hits, bps 어느 것에도 해당하지 않는 일반 숫자 처리
-            if float(value).is_integer():
-                return f"{value:,.0f}"
+            # Bytes, Hits, bps 어느 것에도 해당하지 않는 '일반 숫자' 처리
+            if float_val.is_integer():
+                return f"{float_val:,.0f}"
             else:
-                return f"{value:,.2f}"
+                return f"{float_val:,.2f}"
             
-        # 6. 지정된 단위가 있는 경우에만 스케일링 적용 (K, M, G, T, P)
-        if value >= 1_000_000_000_000_000: return f"{value / 1_000_000_000_000_000:,.2f} {u_p}"
-        elif value >= 1_000_000_000_000: return f"{value / 1_000_000_000_000:,.2f} {u_t}"
-        elif value >= 1_000_000_000: return f"{value / 1_000_000_000:,.2f} {u_g}"
-        elif value >= 1_000_000: return f"{value / 1_000_000:,.2f} {u_m}"
-        elif value >= 1_000: return f"{value / 1_000:,.2f} {u_k}"
-        else: return f"{value:,.0f} {u_base}"
+        # 7. 지정된 단위가 있는 경우에만 스케일링 적용 (K, M, G, T, P)
+        if float_val >= 1_000_000_000_000_000: return f"{float_val / 1_000_000_000_000_000:,.2f} {u_p}"
+        elif float_val >= 1_000_000_000_000: return f"{float_val / 1_000_000_000_000:,.2f} {u_t}"
+        elif float_val >= 1_000_000_000: return f"{float_val / 1_000_000_000:,.2f} {u_g}"
+        elif float_val >= 1_000_000: return f"{float_val / 1_000_000:,.2f} {u_m}"
+        elif float_val >= 1_000: return f"{float_val / 1_000:,.2f} {u_k}"
+        else: return f"{float_val:,.0f} {u_base}"
 
     def _apply_post_processing(self, data_rows, rules):
         if not rules: return data_rows

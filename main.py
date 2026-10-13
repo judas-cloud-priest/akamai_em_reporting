@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Akamai Traffic Report Generator")
-    parser.add_argument('--template', type=str, required=True, help="Path to the input PPTX template file")
+    parser.add_argument('--template', type=str, help="Path to the input PPTX template file (required unless --test is used)")
     parser.add_argument('--output', type=str, help="Path to save the generated PPTX file (optional)")
     parser.add_argument('--profile', type=str, default='default', help="Akamai .edgerc profile name")
     parser.add_argument('--account-key', type=str, help="Account Switch Key (optional)")
@@ -21,6 +21,10 @@ def parse_arguments():
     parser.add_argument('--cpcodes', type=str, help="Comma-separated list of CPCodes or a path to a CSV/TXT file")
     parser.add_argument('--ignore-cache', action='store_true', help="Ignore all cache and force API calls")
     parser.add_argument('--ignore-cache-slides', type=str, help="Comma-separated slide numbers to ignore cache")
+    
+    # JSON 파일을 읽어 API 원시 응답을 출력
+    parser.add_argument('--test', type=str, help="Path to a JSON file containing alt-text to test API directly to stdout")
+    
     return parser.parse_args()
 
 def resolve_cpcodes(cpcodes_input):
@@ -63,12 +67,90 @@ def resolve_cpcodes(cpcodes_input):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    final_output = args.output if args.output else get_auto_output_filename()
-    args.output = final_output
     
-    # [핵심] cpcodes 인자를 가로채어 스마트 파싱 적용
+    # CP Code 스마트 파싱 적용
     if args.cpcodes:
         args.cpcodes = resolve_cpcodes(args.cpcodes)
+        
+    # ==========================================
+    # [TEST MODE] --test 인자가 주어졌을 때의 동작
+    # ==========================================
+    if args.test:
+        import sys
+        import json
+        
+        logger.info(f"🔧 RUNNING IN TEST MODE: Reading directive from {args.test}")
+        try:
+            with open(args.test, 'r', encoding='utf-8') as f:
+                directive = json.load(f)
+                
+            api_client = AkamaiAPIWrapper(
+                profile=args.profile, 
+                fallback_account_key=args.account_key
+            )
+            
+            endpoint = directive.get("endpoint", "")
+            if args.start: endpoint = endpoint.replace("{START_DATE}", args.start)
+            if args.end: endpoint = endpoint.replace("{END_DATE}", args.end)
+            
+            payload = directive.get("payload", {})
+            payload_str = json.dumps(payload)
+            if args.start: payload_str = payload_str.replace("{START_DATE}", args.start)
+            if args.end: payload_str = payload_str.replace("{END_DATE}", args.end)
+            
+            payload = json.loads(payload_str)
+            cpcode_list = [c.strip() for c in args.cpcodes.split(',')] if args.cpcodes else []
+            
+            # 👇 수정한 부분
+            def replace_cpcode_in_dict(d):
+                for k, v in d.items():
+                    if isinstance(v, dict):
+                        replace_cpcode_in_dict(v)
+                    elif isinstance(v, list):
+                        new_list = []
+                        for item in v:
+                            if item == "{CPCODE_LIST}":
+                                new_list.extend(cpcode_list)
+                            elif isinstance(item, dict):
+                                replace_cpcode_in_dict(item)
+                                new_list.append(item)
+                            else:
+                                new_list.append(item)
+                        d[k] = new_list
+            replace_cpcode_in_dict(payload)
+            # 👆 여기까지
+            
+            logger.info(f"Target Endpoint: {endpoint}")
+            logger.info("Executing direct API Request (ignoring cache)...")
+            
+            response = api_client.request(
+                method=directive.get("method", "POST"),
+                endpoint=endpoint,
+                payload=payload,
+                ignore_cache=True
+            )
+            
+            print("\n" + "="*60)
+            print("✅ AKAMAI API RAW RESPONSE STDOUT".center(60))
+            print("="*60)
+            print(json.dumps(response, indent=2, ensure_ascii=False))
+            print("="*60 + "\n")
+            
+            sys.exit(0)
+            
+        except Exception as e:
+            logger.error(f"Test mode failed: {e}")
+            sys.exit(1)
+            
+    # ==========================================
+    # [NORMAL MODE] 기본 PPTX 생성 로직
+    # ==========================================
+    if not args.template:
+        logger.error("the following arguments are required: --template (unless --test is used)")
+        exit(1)
+
+    final_output = args.output if args.output else get_auto_output_filename()
+    args.output = final_output
     
     logger.info(f"Starting script with template: {args.template}")
     logger.info(f"Output will be saved to: {args.output}")
