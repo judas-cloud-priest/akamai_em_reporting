@@ -238,12 +238,13 @@ class PPTXOrchestrator:
         target_upper = target_tag.upper()
         metric_upper = metric.upper()
         
-        # 1. CP Code 처리 (콤마나 단위 없이 순수 텍스트/숫자로 출력)
+        # 1. CP Code 처리 (앞자리의 '0'을 완벽히 보존하며 콤마 없이 출력)
         if "CPCODE" in target_upper or "CPCODE" in metric_upper:
-            try:
-                return str(int(float(value)))
-            except (ValueError, TypeError):
-                return str(value)
+            val_str = str(value)
+            # 데이터 처리 중 float로 변환되어 ".0"이 붙은 경우만 잘라냄
+            if val_str.endswith('.0'):
+                return val_str[:-2]
+            return val_str
 
         # 2. 퍼센트(%) 처리
         if "PERCENT" in target_upper or "PCT" in target_upper or "ACC_VOL" in target_upper or "PERCENT" in metric_upper or "OFFLOAD" in target_upper:
