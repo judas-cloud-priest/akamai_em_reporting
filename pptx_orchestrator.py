@@ -151,41 +151,14 @@ class PPTXOrchestrator:
             return str(date_str)
 
     def _process_shape_directive(self, slide_idx, shape, directive, ignore_cache):
-        active_start, active_end = self.current_start, self.current_end
-        active_cpcodes = self.current_cpcodes
-        active_service_name = self.current_service_name
-        
-        overrides = directive.get("override_params", {})
-        if overrides:
-            active_start = overrides.get("START_DATE", active_start)
-            active_end = overrides.get("END_DATE", active_end)
-            active_cpcodes = overrides.get("CPCODE_LIST", active_cpcodes)
-            active_service_name = overrides.get("SERVICE_NAME", active_service_name)
-
-        if not active_start or not active_end or not active_cpcodes:
-            return
-
-        cpcode_list = [code.strip() for code in active_cpcodes.split(',')]
-        endpoint_template = directive.get("endpoint", "")
-        
-        # 날짜 포맷 강제 변환 (Z 포맷)
-        api_start = self._format_api_date(active_start) if hasattr(self, '_format_api_date') else active_start
-        api_end = self._format_api_date(active_end) if hasattr(self, '_format_api_date') else active_end
-        
-        # INTERVAL에 따른 날짜 올림 처리 로직 명시
-        if "INTERVAL=DAY" in endpoint_template.upper():
-            api_start = self._align_date_for_interval(api_start, "DAY", is_end=False)
-            api_end = self._align_date_for_interval(api_end, "DAY", is_end=True)
-        elif "INTERVAL=MONTH" in endpoint_template.upper():
-            api_start = self._align_date_for_interval(api_start, "MONTH", is_end=False)
-            api_end = self._align_date_for_interval(api_end, "MONTH", is_end=True)
+        # ... (변수 치환 로직) ...
         
         endpoint = endpoint_template.replace("{START_DATE}", api_start).replace("{END_DATE}", api_end)
-        
         raw_payload = directive.get("payload", {})
         payload = self._replace_placeholders(raw_payload, cpcode_list, api_start, api_end, active_service_name)
         
         try:
+            # api_client가 분할 및 병합을 알아서 처리하므로 단일 호출처럼 사용
             response_data = self.api_client.request(
                 method=directive.get("method", "POST"), 
                 endpoint=endpoint, 

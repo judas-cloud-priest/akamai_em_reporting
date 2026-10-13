@@ -20,10 +20,12 @@ def parse_arguments():
     parser.add_argument('--end', type=str, help="End Date (e.g., 2026-08-31T23:59:59Z)")
     parser.add_argument('--cpcodes', type=str, help="Comma-separated list of CPCodes or a path to a CSV/TXT file")
     parser.add_argument('--ignore-cache', action='store_true', help="Ignore all cache and force API calls")
-    parser.add_argument('--ignore-cache-slides', type=str, help="Comma-separated slide numbers to ignore cache")
+    parser.add_argument('--ignore-cache-slides', type=str, help="Ignore cache for specific slides")
     
-    # JSON 파일을 읽어 API 원시 응답을 출력
-    parser.add_argument('--test', type=str, help="Path to a JSON file containing alt-text to test API directly to stdout")
+    # 💡 [새로 추가] API 호출 시 분할할 CP Code 최대 개수 (기본값: 20)
+    parser.add_argument('--chunk-size', type=int, default=20, help="Max number of CPCodes per API call chunk (default: 20)")
+    
+    parser.add_argument('--test', type=str, help="Path to JSON file to test API directly to stdout")
     
     return parser.parse_args()
 
@@ -86,7 +88,8 @@ if __name__ == "__main__":
                 
             api_client = AkamaiAPIWrapper(
                 profile=args.profile, 
-                fallback_account_key=args.account_key
+                fallback_account_key=args.account_key,
+                chunk_size=args.chunk_size
             )
             
             endpoint = directive.get("endpoint", "")
