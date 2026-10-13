@@ -8,3 +8,7 @@ data/
 *.ppt
 *.html
 *.zip
+*.csv
+*.xlsx
+*.xls
+*.txt
