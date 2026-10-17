@@ -15,10 +15,10 @@ from utils import normalize_string
 logger = logging.getLogger(__name__)
 
 class AkamaiAPIWrapper:
-    def __init__(self, profile='default', edgerc_path='~/.edgerc', fallback_account_key=None, chunk_size=20):
+    def __init__(self, profile='default', edgerc_path='~/.edgerc', fallback_account_key=None, max_cpcodes=20):
         self.edgerc_path = os.path.expanduser(edgerc_path)
         self.profile = profile
-        self.chunk_size = chunk_size  # 💡 [새로 추가] 기본값 20 또는 CLI 지정값 저장
+        self.max_cpcodes = max_cpcodes  # 💡 [수정됨] 변수명 변경
         self.session = requests.Session()
         
         try:
@@ -56,24 +56,73 @@ class AkamaiAPIWrapper:
             logger.error(f"Failed to initialize Akamai EdgeGrid authentication: {e}")
             raise
 
-    def _merge_reporting_responses(self, responses):
+    # 💡 파라미터에 payload=None 이 추가되었습니다.
+    def _merge_reporting_responses(self, responses, payload=None):
         if not responses: return {}
         if len(responses) == 1: return responses[0]
 
         base_resp = copy.deepcopy(responses[0])
         
-        # 💡 [신규] 응답 구조 검증 및 경고
         if "metadata" not in base_resp or "data" not in base_resp:
-            logger.warning("⚠️ [Data Merge Warning] API 응답이 표준 Reporting API 구조(metadata/data)를 따르지 않습니다. 병합을 건너뛰고 첫 번째 응답만 반환합니다.")
+            logger.warning("⚠️ [Data Merge Warning] API 응답이 표준 구조를 따르지 않습니다.")
             return base_resp
 
         group_by_keys = base_resp.get("metadata", {}).get("groupBy", [])
-        if not group_by_keys:
-            logger.warning("⚠️ [Data Merge Warning] 응답 메타데이터에 'groupBy' 키가 없어 데이터를 식별할 수 없습니다. 병합이 불완전할 수 있습니다.")
+        if not group_by_keys and payload and "dimensions" in payload:
+            group_by_keys = payload.get("dimensions", [])
+
+        # 💡 [핵심 수정] 비율 지표의 원본(Base) 지표 이름 유연한 매핑 (V1/V2 완벽 호환)
+        original_keys = responses[0].get("data", [{}])[0].keys() if responses[0].get("data") else []
+        pct_to_base = {}
+        
+        for k in original_keys:
+            if "PERCENT" in k.upper() or "PCT" in k.upper():
+                base_metric = None
+                k_lower = k.lower()
+                prefix = ""
+                
+                # 1. 접미사(Suffix)에 따라 유연하게 원본 키워드 추출
+                if k_lower.endswith("percentage"): prefix = k[:-10]    # edgeHitsPercentage -> edgeHits
+                elif k_lower.endswith("percent"): prefix = k[:-7]      # successfulHitsPercent -> successfulHits
+                elif k_lower.endswith("pct"): prefix = k[:-3]          # xxxPct -> xxx
+                
+                if prefix:
+                    # 2. V2 API (예: edgeHitsSum) 대응
+                    if prefix + "Sum" in original_keys:
+                        base_metric = prefix + "Sum"
+                    # 3. V1 API (예: successfulHits) 대응
+                    elif prefix in original_keys:
+                        base_metric = prefix
+                        
+                if base_metric: 
+                    pct_to_base[k] = base_metric
+
+        true_global_totals = {}
+        
+        # 💡 [핵심 추가] 각 청크별로 (성공Hits + 실패Hits)를 모두 포함한 진짜 분모를 역산하여 누적
+        for resp in responses:
+            for pct_metric, base_metric in pct_to_base.items():
+                chunk_true_total = 0.0
+                max_val = -1
+                best_row = None
+                # 부동소수점 오차를 최소화하기 위해 해당 청크에서 값이 가장 큰 Row를 역산 기준으로 삼음
+                for row in resp.get("data", []):
+                    try:
+                        v, p = float(row.get(base_metric, 0)), float(row.get(pct_metric, 0))
+                        if v > max_val and p > 0:
+                            max_val, best_row = v, row
+                    except (ValueError, TypeError): pass
+                
+                if best_row:
+                    v, p = float(best_row[base_metric]), float(best_row[pct_metric])
+                    # 역산 공식: 진짜 총합 = 기준값 / (퍼센트 / 100)
+                    chunk_true_total = v / (p / 100.0)
+                
+                true_global_totals[base_metric] = true_global_totals.get(base_metric, 0.0) + chunk_true_total
 
         merged_data = {}
-        total_sums = {}
-
+        
+        # 원시 데이터 그룹핑 및 합산
         for resp in responses:
             for row in resp.get("data", []):
                 row_key = tuple(row.get(k, "") for k in group_by_keys)
@@ -83,35 +132,43 @@ class AkamaiAPIWrapper:
 
                 for k, v in row.items():
                     if k in group_by_keys: continue
-
-                    if "PERCENT" in k.upper() or "PCT" in k.upper() or "RATE" in k.upper():
-                        if "CACHE" in k.upper() or "OFFLOAD" in k.upper():
-                            logger.warning(f"⚠️ [Data Merge Warning] '{k}' 복합 비율(Rate) 지표가 감지되었습니다. 로컬 병합 시 데이터 왜곡이 발생할 수 있습니다.")
-                        continue
+                    if "PERCENT" in k.upper() or "PCT" in k.upper() or "RATE" in k.upper(): continue
 
                     try:
-                        val = float(v)
-                        merged_data[row_key][k] = merged_data[row_key].get(k, 0.0) + val
-                        total_sums[k] = total_sums.get(k, 0.0) + val
+                        merged_data[row_key][k] = merged_data[row_key].get(k, 0.0) + float(v)
                     except (ValueError, TypeError):
                         if k not in merged_data[row_key]:
                             merged_data[row_key][k] = v
 
         final_data_list = []
-        original_keys = responses[0].get("data", [{}])[0].keys() if responses[0].get("data") else []
 
+        # 퍼센트(비율) 재계산 시, 단순 합산값이 아닌 '진짜 총합(True Global Total)' 사용
         for row_key, row_dict in merged_data.items():
             for k in original_keys:
-                if "PERCENT" in k.upper() or "PCT" in k.upper():
-                    base_metric = None
-                    if k.lower().endswith("percent"): base_metric = k[:-7]
-                    elif k.lower().endswith("pct"): base_metric = k[:-3]
-
-                    if base_metric and base_metric in row_dict and total_sums.get(base_metric, 0) > 0:
-                        row_dict[k] = (row_dict[base_metric] / total_sums[base_metric]) * 100
+                # 1. 일반 분포 비율(%) 지표 처리 (진짜 분모 기반)
+                if k in pct_to_base:
+                    base_metric = pct_to_base[k]
+                    global_denom = true_global_totals.get(base_metric, 0)
+                    
+                    if base_metric in row_dict and global_denom > 0:
+                        row_dict[k] = (row_dict[base_metric] / global_denom) * 100
                     else:
                         row_dict[k] = 0.0
 
+            # 💡 [핵심 추가] 오프로드율(Offload) 전용 재계산 로직 (V1/V2 호환 및 음수 방어)
+            if "offloadedBytesPercentage" in original_keys:
+                edge = float(row_dict.get("edgeBytesSum", row_dict.get("edgeBytes", 0)))
+                origin = float(row_dict.get("originBytesSum", row_dict.get("originBytes", 0)))
+                calc_pct = ((edge - origin) / edge) * 100 if edge > 0 else 0.0
+                row_dict["offloadedBytesPercentage"] = max(0.0, calc_pct)
+                
+            if "offloadedHitsPercentage" in original_keys:
+                edge_h = float(row_dict.get("edgeHitsSum", row_dict.get("edgeHits", 0)))
+                origin_h = float(row_dict.get("originHitsSum", row_dict.get("originHits", 0)))
+                calc_pct_h = ((edge_h - origin_h) / edge_h) * 100 if edge_h > 0 else 0.0
+                row_dict["offloadedHitsPercentage"] = max(0.0, calc_pct_h)
+
+            # 숫자 포맷팅 및 문자열 변환
             for k, v in row_dict.items():
                 if isinstance(v, float):
                     row_dict[k] = str(int(v)) if v.is_integer() else str(v)
@@ -138,18 +195,15 @@ class AkamaiAPIWrapper:
         return [], None
 
     def request(self, method, endpoint, payload=None, ignore_cache=False, **kwargs):
-        # CP Code 추출 시도
         cp_codes, payload_type = self._extract_cpcodes_from_payload(payload)
         
-        # CP Code 개수가 지정된 chunk_size를 초과할 경우 분할 호출
-        if cp_codes and len(cp_codes) > self.chunk_size:
+        if cp_codes and len(cp_codes) > self.max_cpcodes:
             responses = []
             
-            for i in range(0, len(cp_codes), self.chunk_size):
-                chunk = cp_codes[i:i + self.chunk_size]
+            for i in range(0, len(cp_codes), self.max_cpcodes):
+                chunk = cp_codes[i:i + self.max_cpcodes]
                 chunk_payload = copy.deepcopy(payload)
                 
-                # 추출된 경로에 맞게 청크 삽입
                 if payload_type == "v1":
                     chunk_payload["objectIds"] = chunk
                 elif payload_type.startswith("v2_"):
@@ -159,9 +213,9 @@ class AkamaiAPIWrapper:
                 resp = self._make_single_request(method, endpoint, chunk_payload, ignore_cache, **kwargs)
                 responses.append(resp)
                 
-            return self._merge_reporting_responses(responses)
+            # 💡 [핵심 수정 3] 병합 함수에 payload를 넘겨주어 dimensions 키를 찾을 수 있게 합니다.
+            return self._merge_reporting_responses(responses, payload=payload)
             
-        # chunk_size 이하이거나 일반 요청인 경우 그대로 호출
         return self._make_single_request(method, endpoint, payload, ignore_cache, **kwargs)
 
     def _make_single_request(self, method, endpoint, payload, ignore_cache, **kwargs):
@@ -206,8 +260,25 @@ class AkamaiAPIWrapper:
 
             except requests.exceptions.RequestException as e:
                 if 'response' in locals() and response is not None and response.status_code not in [429]:
-                    logger.error(f"HTTP Error {response.status_code}: {response.text}")
-                    raise
+                    # 1. 기본 에러 메시지 구성
+                    error_msg = f"{response.status_code} Server Error for url: {url}\n{response.text}"
+                    
+                    # 2. 5xx 에러 발생 시 CP Code 개수를 검사하여 조치 가이드 추가
+                    if response.status_code >= 500:
+                        cp_codes, _ = self._extract_cpcodes_from_payload(payload)
+                        num_cpcodes = len(cp_codes) if cp_codes else 0
+                        
+                        if num_cpcodes > 10:  # 한 번에 10개를 초과하여 요청한 경우 과부하로 간주
+                            hint_msg = (
+                                f"\n💡 [조치 권고] Akamai 백엔드 서버의 연산 한계 초과 (Timeout/Crash)가 발생했습니다. "
+                                f"(현재 단일 호출에 포함된 CP Code: {num_cpcodes}개)\n"
+                                f"👉 이 차트/표는 건너뜁니다. 명령어 실행 시 '--max-cpcodes 10' 이하로 값을 낮추어 다시 실행해 보세요."
+                            )
+                            error_msg += hint_msg
+                    
+                    # Orchestrator의 try...except가 잡아서 로그를 예쁘게 출력하도록 Exception 발생
+                    raise Exception(error_msg)
+                    
                 elif 'response' not in locals() or response is None:
                     logger.error(f"Network error: {e}")
                     raise

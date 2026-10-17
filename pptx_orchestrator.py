@@ -1,3 +1,5 @@
+import os
+import csv
 import re
 import time
 import json
@@ -7,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm  # 💡 [추가] 로깅 충돌 방지 모듈
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +40,63 @@ class PPTXOrchestrator:
             text = slide.notes_slide.notes_text_frame.text
             if text:
                 text = text.strip().replace('“', '"').replace('”', '"')
+                
+                # 💡 [핵심 추가] JSON 파싱 전 주석 제거 전처리 로직
+                import re
+                # 1. 멀티라인 주석 (/* ... */) 제거
+                text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+                # 2. 한 줄 주석 (// ...) 제거 
+                # (URL인 https:// 훼손 방지를 위해 줄 시작 부분에 있는 주석만 안전하게 제거)
+                text = re.sub(r'^\s*//.*$', '', text, flags=re.MULTILINE)
+                
+                text = text.strip()
+                
                 if text.startswith('{'):
                     try:
                         return json.loads(text)
                     except json.JSONDecodeError as e:
-                        logger.warning(f"[Slide {slide_idx}] Slide notes JSON parsing failed: {e}")
+                        logger.error(
+                            f"\n❌ [Slide {slide_idx}] 슬라이드 노트(Global Params) JSON 구문 분석 실패!\n"
+                            f"에러 원인: {e}\n"
+                            f"문제가 발생한 JSON 원본:\n{text}\n"
+                            f"{'-'*50}"
+                        )
         return {}
+
+    def _resolve_cpcode_list(self, cpcode_val):
+        """'file:' 접두어가 있으면 CSV를 읽어오고, 아니면 원본 텍스트를 반환합니다."""
+        if isinstance(cpcode_val, str) and cpcode_val.strip().startswith("file:"):
+            # 'file:' 이후의 경로 추출 (앞뒤 공백 제거)
+            file_path = cpcode_val.replace("file:", "", 1).strip()
+            
+            # 파이썬 스크립트 실행 위치(CWD)를 기준으로 절대 경로 생성
+            abs_path = os.path.abspath(file_path)
+            
+            if not os.path.exists(abs_path):
+                logger.error(f"❌ CPCode CSV 파일을 찾을 수 없습니다: {abs_path}")
+                return ""
+                
+            cpcodes = []
+            try:
+                import csv
+                # BOM(Byte Order Mark)이 포함된 UTF-8 엑셀 CSV도 안전하게 읽기 위해 utf-8-sig 사용
+                with open(abs_path, 'r', encoding='utf-8-sig') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        for cell in row:
+                            cleaned = cell.strip()
+                            # 순수 숫자(CP Code)만 추출하여 안전하게 배열에 담음
+                            if cleaned.isdigit():
+                                cpcodes.append(cleaned)
+                
+                logger.info(f"📁 CSV 파일에서 {len(cpcodes)}개의 CP Code를 성공적으로 로드했습니다. ({abs_path})")
+            except Exception as e:
+                logger.error(f"❌ CSV 읽기 실패 ({abs_path}): {e}")
+                
+            # 쉼표로 연결된 단일 문자열로 반환 (기존 하드코딩 방식과 완벽 호환)
+            return ", ".join(cpcodes)
+            
+        return cpcode_val
 
     def _format_date_to_ymd(self, date_str):
         if not date_str: return ""
@@ -72,51 +126,120 @@ class PPTXOrchestrator:
         
         self.current_start = self.global_args.start
         self.current_end = self.global_args.end
-        self.current_cpcodes = self.global_args.cpcodes
+        self.current_cpcodes = getattr(self.global_args, 'cpcodes', None)
         self.current_service_name = getattr(self.global_args, 'service_name', None)
         
-        for slide_idx, slide in tqdm(enumerate(self.prs.slides, start=1), total=len(self.prs.slides), desc="Processing Slides"):
-            ignore_cache = self._should_ignore_cache_for_slide(slide_idx)
-            
-            slide_notes = self._parse_slide_notes(slide, slide_idx)
-            if "global_params" in slide_notes:
-                params = slide_notes["global_params"]
-                self.current_start = params.get("START_DATE", self.current_start)
-                self.current_end = params.get("END_DATE", self.current_end)
-                self.current_cpcodes = params.get("CPCODE_LIST", self.current_cpcodes)
-                self.current_service_name = params.get("SERVICE_NAME", self.current_service_name)
-            
-            global_tags = {}
-            if self.current_service_name:
-                global_tags["{{SERVICE_NAME}}"] = str(self.current_service_name)
-            if self.current_start:
-                global_tags["{{START_DATE}}"] = self._format_date_to_ymd(self.current_start)
-                global_tags["{{START_MONTH}}"] = self._extract_month_abbr(self.current_start)
-                global_tags["{{START_YEAR}}"] = self._extract_year(self.current_start)
-            if self.current_end:
-                global_tags["{{END_DATE}}"] = self._format_date_to_ymd(self.current_end)
-                global_tags["{{END_MONTH}}"] = self._extract_month_abbr(self.current_end)
-                global_tags["{{END_YEAR}}"] = self._extract_year(self.current_end)
-            
-            for shape in slide.shapes:
-                if global_tags:
-                    self._replace_tags_in_shape(shape, global_tags)
+        # 💡 [핵심 추가] 에러가 발생한 슬라이드 번호를 추적하기 위한 집합(Set)
+        self.failed_slides = set()
+        
+        target_slides = getattr(self.global_args, 'target_slides_list', [])
+        if target_slides:
+            logger.info(f"🎯 Targeted processing enabled for slides: {target_slides}")
+
+        with logging_redirect_tqdm():
+            for slide_idx, slide in tqdm(
+                enumerate(self.prs.slides, start=1), 
+                total=len(self.prs.slides), 
+                desc="Processing Slides",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} Slides [Elapsed: {elapsed}]"
+            ):
+                ignore_cache = self._should_ignore_cache_for_slide(slide_idx)
                 
-                alt_text = self._get_alt_text(shape)
-                if not alt_text or not alt_text.strip().startswith('{'):
-                    continue
+                # 1. 💡 상태(State) 동기화: 슬라이드 노트는 무조건 읽어서 전역 변수 업데이트 (전체 슬라이드 수행)
+                slide_notes = self._parse_slide_notes(slide, slide_idx)
+                if "global_params" in slide_notes:
+                    params = slide_notes["global_params"]
+                    self.current_start = params.get("START_DATE", self.current_start)
+                    self.current_end = params.get("END_DATE", self.current_end)
                     
-                try:
-                    alt_text = alt_text.replace('“', '"').replace('”', '"')
-                    directive = json.loads(alt_text)
-                except json.JSONDecodeError:
-                    continue
+                    raw_cpcodes = params.get("CPCODE_LIST", self.current_cpcodes)
+                    if hasattr(self, '_resolve_cpcode_list'):
+                        self.current_cpcodes = self._resolve_cpcode_list(raw_cpcodes)
+                    else:
+                        self.current_cpcodes = raw_cpcodes
+                        
+                    self.current_service_name = params.get("SERVICE_NAME", self.current_service_name)
+                
+                # 2. 전역 텍스트 태그 설정
+                global_tags = {}
+                if self.current_service_name:
+                    global_tags["{{SERVICE_NAME}}"] = str(self.current_service_name)
+                if self.current_start:
+                    global_tags["{{START_DATE}}"] = self._format_date_to_ymd(self.current_start)
+                    global_tags["{{START_MONTH}}"] = self._extract_month_abbr(self.current_start)
+                    global_tags["{{START_YEAR}}"] = self._extract_year(self.current_start)
+                if self.current_end:
+                    global_tags["{{END_DATE}}"] = self._format_date_to_ymd(self.current_end)
+                    global_tags["{{END_MONTH}}"] = self._extract_month_abbr(self.current_end)
+                    global_tags["{{END_YEAR}}"] = self._extract_year(self.current_end)
+                
+                # 3. 💡 타겟 슬라이드 여부 확인 (지정되지 않았으면 모두 True 처리)
+                is_target_slide = (not target_slides) or (slide_idx in target_slides)
+
+                # 💡 [핵심 추가] 타겟 슬라이드가 아니면 출력 PPTX 파일에서 '슬라이드 숨기기' 처리
+                if not is_target_slide:
+                    slide.element.set('show', '0')
+                else:
+                    # 만약 템플릿 원본에서 숨겨져 있던 슬라이드라면 타겟 지정 시 강제로 숨김 해제
+                    if 'show' in slide.element.attrib:
+                        del slide.element.attrib['show']
+
+                for shape in slide.shapes:
+                    # 텍스트 태그 치환은 모든 슬라이드에서 수행 (문서 일관성 유지)
+                    if global_tags:
+                        self._replace_tags_in_shape(shape, global_tags)
                     
-                self._process_shape_directive(slide_idx, shape, directive, ignore_cache)
-                time.sleep(0.15)
+                    # API 호출 및 도형 업데이트 로직은 타겟 슬라이드만 수행
+                    if not is_target_slide:
+                        continue
+                    
+                    alt_text = self._get_alt_text(shape)
+                    if not alt_text:
+                        continue
+                        
+                    # 💡 [핵심 추가] 도형이 표, 차트, 텍스트 박스 중 하나인지 판별
+                    is_targetable_shape = getattr(shape, "has_table", False) or getattr(shape, "has_chart", False) or getattr(shape, "has_text_frame", False)
+                    
+                    if not alt_text.strip().startswith('{'):
+                        # 데이터가 채워질 수 있는 도형인데 JSON이 아니라면 로그 출력 후 스킵
+                        if is_targetable_shape:
+                            preview = alt_text.strip()[:50].replace('\n', ' ')
+                            logger.info(
+                                f"⏭️ [Slide {slide_idx}] 표/차트/텍스트 박스의 대체 텍스트가 JSON 형식이 아니어서 일반 텍스트로 간주하고 스킵합니다. (preview: {preview}...)"
+                            )
+                        continue
+                        
+                    try:
+                        alt_text = alt_text.replace('“', '"').replace('”', '"')
+                        directive = json.loads(alt_text)
+                    except json.JSONDecodeError as e:
+                        self.failed_slides.add(slide_idx)
+                        logger.error(
+                            f"\n❌ [Slide {slide_idx}] 도형 대체 텍스트(Alt Text) JSON 구문 분석 실패!\n"
+                            f"에러 원인: {e}\n"
+                            f"문제가 발생한 JSON 원본:\n{alt_text}\n"
+                            f"{'-'*50}"
+                        )
+                        continue
+                        
+                    self._process_shape_directive(slide_idx, shape, directive, ignore_cache)
+                    time.sleep(0.15)
                 
         self.prs.save(self.output_path)
         logger.info(f"Successfully processed and saved to {self.output_path}")
+        
+        # 💡 [핵심 추가] 스크립트 종료 시 실패한 슬라이드 목록 요약 및 가이드 출력
+        if self.failed_slides:
+            failed_str = ",".join(map(str, sorted(list(self.failed_slides))))
+            logger.warning(
+                f"\n{'='*70}\n"
+                f"⚠️ [재실행 가이드] 일부 슬라이드의 처리가 완료되지 않았습니다 (API 실패/Timeout 등).\n"
+                f"다음 파라미터를 복사하여 실패한 슬라이드만 빠르게 다시 실행해 보세요:\n\n"
+                f"   --slides \"{failed_str}\"\n\n"
+                f"{'='*70}"
+            )
+        else:
+            logger.info("✅ 모든 슬라이드가 오류 없이 완벽하게 처리되었습니다!")
 
     def _align_date_for_interval(self, date_str, interval, is_end=False):
         if not date_str: return date_str
@@ -151,14 +274,33 @@ class PPTXOrchestrator:
             return str(date_str)
 
     def _process_shape_directive(self, slide_idx, shape, directive, ignore_cache):
-        # ... (변수 치환 로직) ...
+        # 1. 템플릿에서 엔드포인트 가져오기
+        endpoint_template = directive.get("endpoint", "")
         
-        endpoint = endpoint_template.replace("{START_DATE}", api_start).replace("{END_DATE}", api_end)
+        # 2. 전역 변수 설정
+        api_start = self.current_start
+        api_end = self.current_end
+        active_service_name = self.current_service_name
+        
+        cpcode_list = []
+        if self.current_cpcodes:
+            cpcode_list = [c.strip() for c in str(self.current_cpcodes).split(',')]
+
+        # 3. 날짜 정렬 적용
+        if "interval=MONTH" in endpoint_template.upper():
+            api_start = self._align_date_for_interval(api_start, "MONTH", is_end=False)
+            api_end = self._align_date_for_interval(api_end, "MONTH", is_end=True)
+        elif "interval=DAY" in endpoint_template.upper():
+            api_start = self._align_date_for_interval(api_start, "DAY", is_end=False)
+            api_end = self._align_date_for_interval(api_end, "DAY", is_end=True)
+
+        # 4. 변수 치환
+        endpoint = endpoint_template.replace("{START_DATE}", str(api_start)).replace("{END_DATE}", str(api_end))
         raw_payload = directive.get("payload", {})
-        payload = self._replace_placeholders(raw_payload, cpcode_list, api_start, api_end, active_service_name)
+        payload = self._replace_placeholders(raw_payload, cpcode_list, str(api_start), str(api_end), active_service_name)
         
+        # 5. API 호출 및 렌더링
         try:
-            # api_client가 분할 및 병합을 알아서 처리하므로 단일 호출처럼 사용
             response_data = self.api_client.request(
                 method=directive.get("method", "POST"), 
                 endpoint=endpoint, 
@@ -167,7 +309,19 @@ class PPTXOrchestrator:
             )
             self._render_shape(slide_idx, shape, directive.get("action"), directive, response_data)
         except Exception as e:
-            logger.error(f"[Slide {slide_idx}] API call failed for shape: {e}")
+            # 💡 [추가됨] API 에러 또는 차트 렌더링 실패 시 실패 슬라이드로 등록
+            self.failed_slides.add(slide_idx)
+            try:
+                directive_dump = json.dumps(directive, indent=2, ensure_ascii=False)
+            except Exception:
+                directive_dump = str(directive)
+                
+            logger.error(
+                f"\n❌ [Slide {slide_idx}] API 호출 또는 도형 업데이트 실패!\n"
+                f"에러 원인: {e}\n"
+                f"실행을 시도했던 JSON 지시어:\n{directive_dump}\n"
+                f"{'-'*50}"
+            )
 
     def _replace_placeholders(self, obj, cpcode_list, start_date, end_date, service_name=None):
         if isinstance(obj, dict):
@@ -207,28 +361,40 @@ class PPTXOrchestrator:
 
     def _format_x_axis_categories(self, categories):
         formatted = []
-        last_year = None
+        last_date = None
+        
         for cat in categories:
             if not cat:
-                formatted.append(""); continue
+                formatted.append("")
+                continue
+                
             dt, cat_str = None, str(cat).strip()
+            
             try:
                 if float(cat_str) > 1_000_000_000:
                     dt = datetime.fromtimestamp(float(cat_str), tz=timezone.utc)
-            except ValueError: pass
+            except ValueError:
+                pass
+                
             if dt is None:
-                try: dt = datetime.fromisoformat(cat_str.replace('Z', '+00:00'))
-                except ValueError: pass
+                try:
+                    dt = datetime.fromisoformat(cat_str.replace('Z', '+00:00'))
+                except ValueError:
+                    pass
             
             if dt is not None:
-                current_year, current_md = dt.strftime('%y'), dt.strftime('%m.%d')
-                if last_year is None or current_year != last_year:
-                    formatted.append(f"{current_year}.{current_md}")
-                    last_year = current_year
+                current_date = dt.strftime('%m.%d')
+                
+                # 💡 [핵심 로직] 날짜가 바뀌었을 때(하루의 첫 데이터)만 라벨을 출력합니다.
+                if last_date != current_date:
+                    formatted.append(current_date)
+                    last_date = current_date
                 else:
-                    formatted.append(current_md)
+                    # 같은 날짜의 나머지 23시간은 빈칸("")으로 처리하여 X축 중복 출력을 방지합니다.
+                    formatted.append("")
             else:
                 formatted.append(cat_str)
+                
         return formatted
 
     def _apply_unit_formatting(self, value, target_tag, metric=""):
